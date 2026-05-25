@@ -9,3 +9,5 @@ mode = "smart"
 # 2. 限制内存与节点开销，强制启用最新的 V8 编译隔离
 [observability]
 enabled = true
+
+http.host eq "*7.cloudns.org" and http.request.uri.path eq "/vless"
