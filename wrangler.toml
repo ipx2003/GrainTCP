@@ -1,0 +1,11 @@
+name = "your-vless-worker"
+main = "src/index.js"
+compatibility_date = "2026-05-25"
+
+# 1. 开启智能节点调度（核心：让 Worker 贴近你的落地服务器）
+[placement]
+mode = "smart"
+
+# 2. 限制内存与节点开销，强制启用最新的 V8 编译隔离
+[observability]
+enabled = true
