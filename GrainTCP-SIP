@@ -1,0 +1,142 @@
+// 核心轻量化配置
+const CFG = { 
+  id: '2523c510-9ff0-415b-9582-93949bfae7e3', // 您的 UUID
+  chunk: 16 * 1024,  // 调小包大小以完美适配 Snippets 2MB 的极小内存限制
+  maxED: 8 * 1024 
+};
+
+// 启动时单次执行：十六进制预解析（极致节省 CPU 时间）
+const idB = new Uint8Array(CFG.id.replace(/-/g, '').match(/.{1,2}/g).map(b => parseInt(b, 16)));
+const dec = new TextDecoder();
+
+export default {
+  async fetch(req) {
+    // 1. 严格过滤非 WebSocket 请求，非代理请求直接直通交由原站处理
+    if (req.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return fetch(req); 
+    }
+
+    // 2. 建立接管双向通信的 WebSocket 管道
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept({ allowHalfOpen: true });
+    server.binaryType = 'arraybuffer';
+
+    // 3. 提取 0-RTT 早期数据 (Early Data)
+    const edStr = req.headers.get('sec-websocket-protocol');
+    const ed = edStr && edStr.length <= CFG.maxED * 4 / 3 + 4 
+      ? Uint8Array.fromBase64(edStr, { alphabet: 'base64url' }) 
+      : null;
+
+    // 异步执行主代理逻辑（防止阻塞主线程导致 5ms 超时）
+    handleProxy(server, req.fetcher, ed);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+};
+
+// V8 SIMD 级内存对比优化
+const matchID = (c) => c.subarray(1, 17).every((val, i) => val === idB[i]);
+
+const addr = (t, b) => {
+  if (t === 1) return `${b[0]}.${b[1]}.${b[2]}.${b[3]}`;
+  if (t === 3) return dec.decode(b);
+  return `[${Array.from({ length: 8 }, (_, i) => ((b[i * 2] << 8) | b[i * 2 + 1]).toString(16)).join(':')}]`;
+};
+
+const parseAddr = (b, o, t) => {
+  const l = t === 3 ? b[o++] : t === 1 ? 4 : t === 4 ? 16 : null;
+  if (l === null) return null;
+  const n = o + l;
+  return n > b.length ? null : { targetAddrBytes: b.subarray(o, n), dataOffset: n };
+};
+
+const vless = (c) => {
+  if (c.length < 24 || !matchID(c)) return null;
+  let o = 19 + c[17];
+  const p = (c[o] << 8) | c[o + 1];
+  let t = c[o + 2];
+  if (t !== 1) t += 1;
+  const a = parseAddr(c, o + 3, t);
+  return a ? { addrType: t, ...a, port: p } : null;
+};
+
+// 核心处理函数：单次拨号、纯流式直通、零 CPU 闲置消耗
+async function handleProxy(server, fetcher, ed) {
+  let sock = null, curW = null, closed = false;
+
+  const wither = () => {
+    if (closed) return;
+    closed = true;
+    try { curW?.releaseLock(); } catch {}
+    try { sock?.close(); } catch {}
+    try { server.close(); } catch {}
+  };
+
+  // 下行流泵：TCP 响应流 -> 直接泵入 WebSocket
+  const mill = async (rd) => {
+    const r = rd.getReader({ mode: 'byob' });
+    let buf = new ArrayBuffer(CFG.chunk);
+    try {
+      while (!closed) {
+        const { done, value } = await r.read(new Uint8Array(buf, 0, CFG.chunk));
+        if (done) break;
+        if (!value?.byteLength) continue;
+        
+        server.send(value); // 直通发送
+        buf = value.buffer; // 复用内存避免频繁 GC 导致 Snippets 内存溢出
+      }
+    } catch {} finally {
+      try { r.releaseLock(); } catch {}
+      wither();
+    }
+  };
+
+  // 单次稳健拨号逻辑（摒弃原有 raceSprout 4次竞速，收回到 1）
+  const init = async (firstChunk) => {
+    const r = vless(firstChunk);
+    if (!r) { wither(); return; }
+
+    server.send(new Uint8Array([firstChunk[0], 0])); // 响应 VLESS 握手
+    const host = addr(r.addrType, r.targetAddrBytes);
+
+    try {
+      // 核心改动：单次连接建立（拨号收回到 1）
+      sock = await fetcher.connect({ hostname: host, port: r.port });
+      await sock.opened;
+      curW = sock.writable.getWriter();
+
+      const payload = firstChunk.subarray(r.dataOffset);
+      if (payload.byteLength) {
+        await curW.write(payload);
+      }
+
+      // 启动下行接收
+      mill(sock.readable);
+    } catch {
+      wither();
+    }
+  };
+
+  // 上行流泵：WebSocket -> 写入 TCP
+  let firstReceived = false;
+  server.addEventListener('message', async (e) => {
+    if (closed) return;
+    const data = new Uint8Array(e.data);
+
+    if (!firstReceived) {
+      firstReceived = true;
+      await init(data);
+    } else if (curW) {
+      // 完美利用底层原生 C++ 的背压队列，不再在客户端用 JS 数组堆积缓存包
+      curW.write(data).catch(wither);
+    }
+  });
+
+  server.addEventListener('close', wither);
+  server.addEventListener('error', wither);
+
+  if (ed) {
+    firstReceived = true;
+    await init(ed);
+  }
+}
